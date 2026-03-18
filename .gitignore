@@ -1,0 +1,9 @@
+credentials.json
+token.json
+sent_notifications.json
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
