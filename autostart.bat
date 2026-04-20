@@ -1,29 +1,31 @@
 @echo off
-:: Legt bot.exe als Windows-Autostart-Aufgabe an (laeuft beim Systemstart)
+:: Richtet automatischen Start bei Windows-Systemstart ein.
 :: Als Administrator ausfuehren!
 
-set "EXE_PATH=%~dp0bot.exe"
+set "START_BAT=%~dp0Bot starten.bat"
 
-echo Erstelle Windows Aufgabenplanung fuer bot.exe...
+echo Erstelle Windows Aufgabenplanung...
+echo Startet: %START_BAT%
+echo.
 
 schtasks /create ^
     /tn "WhatsApp Kalender Bot" ^
-    /tr "%EXE_PATH%" ^
+    /tr "cmd /c \"%START_BAT%\"" ^
     /sc onstart ^
-    /ru SYSTEM ^
+    /ru "%USERNAME%" ^
     /rl HIGHEST ^
     /f
 
 if errorlevel 1 (
-    echo FEHLER: Bitte als Administrator ausfuehren.
-    pause
-    exit /b 1
+    echo FEHLER: Bitte als Administrator ausfuehren (Rechtsklick -> Als Administrator).
+    pause & exit /b 1
 )
 
 echo.
-echo Fertig! Bot startet automatisch bei jedem Systemstart.
+echo [OK] Bot startet ab jetzt automatisch bei jedem Systemstart.
 echo.
-echo Zum manuellen Starten jetzt:
+echo Zum sofortigen Starten:
 schtasks /run /tn "WhatsApp Kalender Bot"
 echo Bot wurde gestartet.
+echo.
 pause

@@ -1,68 +1,104 @@
 @echo off
-echo ============================================
+chcp 65001 > nul
+echo ================================================
 echo  WhatsApp Kalender-Bot - Build
-echo ============================================
+echo  Erstellt ein fertiges Paket in: release\
+echo ================================================
 echo.
 
-:: Python pruefen
+:: ── Voraussetzungen pruefen ──────────────────────
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo FEHLER: Python nicht gefunden. https://python.org
+    echo FEHLER: Python nicht installiert.
+    echo Download: https://python.org  (Haken bei "Add to PATH" setzen!)
     pause & exit /b 1
 )
 
-:: Node.js pruefen
 node --version >nul 2>&1
 if errorlevel 1 (
-    echo FEHLER: Node.js nicht gefunden. https://nodejs.org
+    echo FEHLER: Node.js nicht installiert.
+    echo Download: https://nodejs.org  (LTS Version)
     pause & exit /b 1
 )
 
-echo [1/4] Installiere Python-Abhaengigkeiten...
+echo [OK] Python und Node.js gefunden.
+echo.
+
+:: ── npm-Pakete installieren ──────────────────────
+echo [1/5] Installiere WhatsApp Bridge Pakete (kann einige Minuten dauern)...
+echo       (laedt auch Chromium fuer WhatsApp Web, ~200 MB)
+echo.
+cd whatsapp-bridge
+call npm install
+if errorlevel 1 ( echo FEHLER bei npm install. & cd .. & pause & exit /b 1 )
+cd ..
+echo.
+
+:: ── Portable node.exe herunterladen ─────────────
+echo [2/5] Lade portable Node.js fuer den Server herunter...
+powershell -Command ^
+  "Invoke-WebRequest -Uri 'https://nodejs.org/dist/v20.11.1/win-x64/node.exe' ^
+  -OutFile 'whatsapp-bridge\node.exe' -UseBasicParsing"
+if errorlevel 1 (
+    echo FEHLER beim Download von node.exe.
+    echo Bitte manuell herunterladen:
+    echo   https://nodejs.org/dist/v20.11.1/win-x64/node.exe
+    echo   -> nach whatsapp-bridge\node.exe speichern
+    pause & exit /b 1
+)
+echo [OK] node.exe heruntergeladen.
+echo.
+
+:: ── Python-Abhaengigkeiten + PyInstaller ─────────
+echo [3/5] Installiere Python-Pakete...
 pip install -r requirements.txt --quiet
 pip install pyinstaller --quiet
-if errorlevel 1 ( echo FEHLER. & pause & exit /b 1 )
+if errorlevel 1 ( echo FEHLER bei pip install. & pause & exit /b 1 )
+echo.
 
-echo [2/4] Installiere Node.js-Abhaengigkeiten (WhatsApp Bridge)...
-cd whatsapp-bridge
-npm install
-cd ..
-if errorlevel 1 ( echo FEHLER. & pause & exit /b 1 )
-
-echo [3/4] Baue bot.exe...
+:: ── bot.exe bauen ────────────────────────────────
+echo [4/5] Baue bot.exe...
 pyinstaller --onefile --noconsole --name bot ^
     --hidden-import=apscheduler.triggers.date ^
     --hidden-import=apscheduler.triggers.interval ^
     --hidden-import=recurring_ical_events ^
     --hidden-import=icalendar ^
     bot.py
-if errorlevel 1 ( echo FEHLER. & pause & exit /b 1 )
+if errorlevel 1 ( echo FEHLER beim Bauen der exe. & pause & exit /b 1 )
+echo.
 
-echo [4/4] Kopiere Dateien nach release\...
-if not exist "release" mkdir release
-if not exist "release\whatsapp-bridge" mkdir release\whatsapp-bridge
-copy dist\bot.exe release\bot.exe >nul
-copy config.ini release\config.ini >nul
-copy start.bat release\start.bat >nul
-copy autostart.bat release\autostart.bat >nul
-xcopy /E /I /Q whatsapp-bridge\*.js release\whatsapp-bridge\ >nul
-xcopy /E /I /Q whatsapp-bridge\package*.json release\whatsapp-bridge\ >nul
-xcopy /E /I /Q whatsapp-bridge\node_modules release\whatsapp-bridge\node_modules\ >nul 2>&1
+:: ── release-Paket zusammenstellen ───────────────
+echo [5/5] Erstelle fertiges Paket in release\...
+if exist release rmdir /s /q release
+mkdir release
+mkdir release\whatsapp-bridge
+
+copy dist\bot.exe        release\bot.exe        >nul
+copy config.ini          release\config.ini     >nul
+copy start.bat           "release\Bot starten.bat" >nul
+copy autostart.bat       release\autostart.bat  >nul
+
+:: whatsapp-bridge komplett kopieren (inkl. node_modules + node.exe)
+xcopy /E /I /Y /Q whatsapp-bridge\*.js       release\whatsapp-bridge\ >nul
+xcopy /E /I /Y /Q whatsapp-bridge\*.json     release\whatsapp-bridge\ >nul
+xcopy /E /I /Y /Q whatsapp-bridge\node.exe   release\whatsapp-bridge\ >nul
+xcopy /E /I /Y /Q whatsapp-bridge\node_modules release\whatsapp-bridge\node_modules\ >nul
 
 echo.
-echo ============================================
-echo  Fertig! Alles in: release\
-echo ============================================
+echo ================================================
+echo  FERTIG! Paket liegt in: release\
+echo ================================================
 echo.
-echo Auf den Server kopieren: den kompletten release\ Ordner
+echo Auf den Heimserver kopieren: den gesamten release\ Ordner
 echo.
-echo ERSTER START:
-echo   1. release\ Ordner auf Server kopieren
-echo   2. start.bat starten
-echo   3. Im Bridge-Fenster erscheint ein QR-Code
-echo   4. QR-Code mit WhatsApp scannen (Geraete verknuepfen)
-echo   5. Fertig! Du kannst dem Bot jetzt Nachrichten schicken.
+echo EINRICHTUNG (einmalig):
+echo   1. release\config.ini oeffnen und ausfuellen:
+echo      - Groq_ApiKey  (kostenlos: console.groq.com)
+echo      - iCal-URLs    (Google Kalender Einstellungen)
 echo.
-echo NAECHSTE STARTS: Einfach start.bat doppelklicken
+echo STARTEN:
+echo   release\Bot starten.bat  doppelklicken
+echo   Beim ersten Start: QR-Code mit WhatsApp scannen
+echo   Danach: laeuft alles automatisch im Hintergrund
 echo.
 pause

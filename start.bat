@@ -1,20 +1,28 @@
 @echo off
-echo ============================================
-echo  WhatsApp Kalender-Bot starten
-echo ============================================
-echo.
+chcp 65001 > nul
+cd /d "%~dp0"
+title WhatsApp Kalender-Bot
 
-:: WhatsApp Bridge starten (im Hintergrund)
-echo [1/2] Starte WhatsApp Bridge...
-cd whatsapp-bridge
-start "WhatsApp Bridge" cmd /k "node index.js"
-cd ..
+:: Pruefe ob Session existiert (nach erstem QR-Scan)
+if exist "whatsapp-bridge\session" (
+    echo [Bridge] Verbinde WhatsApp automatisch...
+    start /min "WhatsApp Bridge" cmd /k "cd /d whatsapp-bridge && node.exe index.js"
+) else (
+    echo.
+    echo ================================================
+    echo  ERSTER START: QR-Code scannen!
+    echo  WhatsApp > Geraete verknuepfen > QR-Code
+    echo  Das Bridge-Fenster wird gleich geoeffnet.
+    echo ================================================
+    echo.
+    start "WhatsApp Bridge - QR-Code scannen!" cmd /k "cd /d whatsapp-bridge && node.exe index.js"
+)
 
-echo Warte 8 Sekunden auf WhatsApp-Verbindung...
-timeout /t 8 /nobreak > nul
+echo Warte auf WhatsApp-Verbindung...
+timeout /t 10 /nobreak > nul
 
-:: Python Bot starten
-echo [2/2] Starte Bot...
-bot.exe
+echo Starte Bot...
+start /b "" bot.exe
 
-pause
+echo Bot laeuft im Hintergrund. Logs: bot.log
+timeout /t 3 /nobreak > nul
