@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 :: Richtet automatischen Start bei Windows-Systemstart ein.
 :: Als Administrator ausfuehren!
 
