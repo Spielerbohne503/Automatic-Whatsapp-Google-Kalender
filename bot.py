@@ -67,7 +67,7 @@ class Config:
             log.error("config.ini erstellt in: %s\nBitte ausfüllen und neu starten.", CONFIG_FILE)
             sys.exit(1)
 
-        cfg = configparser.ConfigParser()
+        cfg = configparser.RawConfigParser()
         cfg.read(CONFIG_FILE, encoding="utf-8")
 
         wa = cfg["WhatsApp"]
