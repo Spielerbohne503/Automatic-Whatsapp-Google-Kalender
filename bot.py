@@ -1,7 +1,9 @@
 """
-WhatsApp Kalender-Bot
-Konfiguration: config.ini (liegt neben der exe)
-Keine credentials.json, kein OAuth – nur iCal-Links aus Google Kalender.
+WhatsApp Kalender-Bot mit KI-Assistent – 100% kostenlos
+- Automatische Erinnerungen aus Google Kalender (iCal)
+- Zwei-Wege WhatsApp via whatsapp-web.js Bridge (gratis)
+- KI-Assistent via Groq API / Llama 3.1 (gratis)
+- Termin-Erstellung per natürlicher Sprache
 """
 
 import configparser
@@ -11,8 +13,9 @@ import os
 import signal
 import sys
 import tempfile
+import threading
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 import pytz
@@ -21,9 +24,10 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from groq import Groq
 from icalendar import Calendar
 
-# ─── Pfade relativ zur exe / zum Skript ─────────────────────────────────────
+# ─── Pfade ───────────────────────────────────────────────────────────────────
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -33,25 +37,23 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
 STATE_FILE  = os.path.join(BASE_DIR, "gesendet.json")
 LOG_FILE    = os.path.join(BASE_DIR, "bot.log")
 
-CALLMEBOT_URL = "https://api.callmebot.com/whatsapp.php"
+BRIDGE_URL = "http://127.0.0.1:3000"
 
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 def setup_logging():
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%d.%m.%Y %H:%M:%S",
-    )
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                            datefmt="%d.%m.%Y %H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=2*1024*1024,
+                              backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt)
     root.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     root.addHandler(sh)
-
 
 log = logging.getLogger("bot")
 
@@ -62,104 +64,85 @@ class Config:
     def __init__(self):
         if not os.path.exists(CONFIG_FILE):
             _create_default_config()
-            log.error(
-                "config.ini wurde erstellt in: %s\n"
-                "Bitte iCal-Links und CallMeBot-API-Key eintragen, dann neu starten.",
-                CONFIG_FILE,
-            )
+            log.error("config.ini erstellt in: %s\nBitte ausfüllen und neu starten.", CONFIG_FILE)
             sys.exit(1)
 
         cfg = configparser.ConfigParser()
         cfg.read(CONFIG_FILE, encoding="utf-8")
 
         wa = cfg["WhatsApp"]
-        self.phone   = wa.get("HandyNummer", "").strip()
-        self.api_key = wa.get("CallMeBot_ApiKey", "").strip()
+        self.meine_nummer = wa.get("MeineNummer", "").strip()
+
+        ki = cfg["KI"]
+        self.groq_key = ki.get("Groq_ApiKey", "").strip()
 
         s = cfg["Einstellungen"]
-        self.timezone      = s.get("Zeitzone", "Europe/Berlin").strip()
-        self.poll_minutes  = int(s.get("AbfrageIntervallMinuten", "5"))
-        self.lookahead_h   = int(s.get("VorausschauStunden", "24"))
-        self.allday_hour   = int(s.get("GanztaegigErinnerungUhrzeit", "8"))
+        self.timezone     = s.get("Zeitzone", "Europe/Berlin").strip()
+        self.poll_minutes = int(s.get("AbfrageIntervallMinuten", "5"))
+        self.lookahead_h  = int(s.get("VorausschauStunden", "24"))
+        self.allday_hour  = int(s.get("GanztaegigErinnerungUhrzeit", "8"))
 
-        # Alle Kalender-URLs aus Sektion [Kalender]
-        if "Kalender" not in cfg:
-            log.error("Sektion [Kalender] fehlt in config.ini.")
-            sys.exit(1)
+        self.calendars: dict[str, str] = {}
+        if "Kalender" in cfg:
+            for name, url in cfg["Kalender"].items():
+                url = url.strip()
+                if url and url != "ICAL_URL_HIER_EINFUEGEN":
+                    self.calendars[name] = url
 
-        self.calendars: dict[str, str] = {}  # Name → URL
-        placeholder = "ICAL_URL_HIER_EINFUEGEN"
-        for name, url in cfg["Kalender"].items():
-            url = url.strip()
-            if url and url != placeholder:
-                self.calendars[name] = url
-
-        # Pflichtfeld-Checks
         missing = []
-        if not self.phone:
-            missing.append("WhatsApp → HandyNummer")
-        if not self.api_key or self.api_key == "HIER_EINTRAGEN":
-            missing.append("WhatsApp → CallMeBot_ApiKey")
+        if not self.meine_nummer:
+            missing.append("WhatsApp → MeineNummer")
+        if not self.groq_key or self.groq_key == "HIER_EINTRAGEN":
+            missing.append("KI → Groq_ApiKey")
         if not self.calendars:
             missing.append("Kalender → mindestens eine iCal-URL eintragen")
         if missing:
-            log.error(
-                "Bitte folgende Felder in config.ini ausfüllen:\n  %s\nDann neu starten.",
-                "\n  ".join(missing),
-            )
+            log.error("Fehlende Felder in config.ini:\n  %s\nDann neu starten.",
+                      "\n  ".join(missing))
             sys.exit(1)
 
 
 def _create_default_config():
     content = """\
 [WhatsApp]
-; Deine Handynummer im internationalen Format
-HandyNummer = +4915226310258
-; API-Key von https://www.callmebot.com/blog/free-api-whatsapp-messages/
-CallMeBot_ApiKey = HIER_EINTRAGEN
+; Deine persönliche WhatsApp-Nummer (hierhin schickt der Bot Nachrichten)
+MeineNummer = +4915226310258
+
+[KI]
+; Groq API Key – kostenlos auf console.groq.com registrieren
+Groq_ApiKey = HIER_EINTRAGEN
 
 [Kalender]
-; Für jeden Kalender den privaten iCal-Link eintragen.
-; So findest du die Links:
-;   1. Öffne calendar.google.com im Browser
-;   2. Klicke oben rechts auf das Zahnrad → "Einstellungen"
-;   3. Links in der Seitenleiste auf den Kalender-Namen klicken
-;   4. Runterscrollen zu "Privatadresse im iCalendar-Format"
-;   5. Den Link kopieren und hier einfügen
+; Privaten iCal-Link aus Google Kalender Einstellungen einfügen
+; (Einstellungen → Kalender-Name → "Privatadresse im iCalendar-Format")
 ;
-; Nicht benötigte Kalender einfach auskommentieren (Semikolon davor setzen).
-;
-Arbeit          = ICAL_URL_HIER_EINFUEGEN
-Privat          = ICAL_URL_HIER_EINFUEGEN
-Training        = ICAL_URL_HIER_EINFUEGEN
-Haushalt        = ICAL_URL_HIER_EINFUEGEN
-HSG             = ICAL_URL_HIER_EINFUEGEN
-Mittelalter     = ICAL_URL_HIER_EINFUEGEN
-Special         = ICAL_URL_HIER_EINFUEGEN
-Geburtstage     = ICAL_URL_HIER_EINFUEGEN
-Graue_Garde     = ICAL_URL_HIER_EINFUEGEN
-Formula_1       = ICAL_URL_HIER_EINFUEGEN
+Arbeit      = ICAL_URL_HIER_EINFUEGEN
+Privat      = ICAL_URL_HIER_EINFUEGEN
+Training    = ICAL_URL_HIER_EINFUEGEN
+Haushalt    = ICAL_URL_HIER_EINFUEGEN
+HSG         = ICAL_URL_HIER_EINFUEGEN
+Mittelalter = ICAL_URL_HIER_EINFUEGEN
+Special     = ICAL_URL_HIER_EINFUEGEN
+Geburtstage = ICAL_URL_HIER_EINFUEGEN
+Graue_Garde = ICAL_URL_HIER_EINFUEGEN
+Formula_1   = ICAL_URL_HIER_EINFUEGEN
 
 [Einstellungen]
-; Zeitzone
-Zeitzone = Europe/Berlin
-; Wie oft der Kalender abgefragt wird (Minuten)
-AbfrageIntervallMinuten = 5
-; Wie weit in die Zukunft gesucht wird (Stunden)
-VorausschauStunden = 24
-; Uhrzeit für ganztägige Termine (Stunde, z.B. 8 = 08:00 Uhr)
+Zeitzone                    = Europe/Berlin
+AbfrageIntervallMinuten     = 5
+VorausschauStunden          = 24
 GanztaegigErinnerungUhrzeit = 8
 """
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write(content)
 
 
-# ─── Kalender (iCal) ─────────────────────────────────────────────────────────
+# ─── iCal / Kalender lesen ───────────────────────────────────────────────────
 
-def fetch_events(config: Config) -> list[dict]:
-    tz       = pytz.timezone(config.timezone)
-    now      = datetime.now(pytz.utc)
-    time_max = now + timedelta(hours=config.lookahead_h)
+def fetch_events(config: Config, lookahead_hours: int = None) -> list[dict]:
+    tz = pytz.timezone(config.timezone)
+    now = datetime.now(pytz.utc)
+    time_max = now + timedelta(hours=lookahead_hours or config.lookahead_h)
 
     events = []
     for cal_name, ical_url in config.calendars.items():
@@ -167,32 +150,27 @@ def fetch_events(config: Config) -> list[dict]:
             resp = requests.get(ical_url, timeout=15)
             resp.raise_for_status()
             cal = Calendar.from_ical(resp.content)
-        except Exception as e:
-            log.error("Fehler beim Laden von Kalender '%s': %s", cal_name, e)
-            continue
-
-        try:
             instances = recurring_ical_events.of(cal).between(now, time_max)
         except Exception as e:
-            log.error("Fehler beim Auslesen von Kalender '%s': %s", cal_name, e)
+            log.error("Fehler Kalender '%s': %s", cal_name, e)
             continue
 
         for vevent in instances:
             try:
                 start_dt = _parse_start(vevent, tz, config.allday_hour)
-                reminder_mins = _parse_reminders(vevent)
                 uid = str(vevent.get("uid", "")) + f"_{cal_name}"
                 events.append({
-                    "uid":             uid,
-                    "summary":         str(vevent.get("summary", "(Kein Titel)")),
-                    "location":        str(vevent.get("location", "") or ""),
-                    "start_dt":        start_dt,
-                    "reminder_minutes": reminder_mins,
+                    "uid":              uid,
+                    "summary":          str(vevent.get("summary", "(Kein Titel)")),
+                    "location":         str(vevent.get("location", "") or ""),
+                    "start_dt":         start_dt,
+                    "reminder_minutes": _parse_reminders(vevent),
+                    "calendar":         cal_name,
                 })
-            except Exception as e:
-                log.warning("Termin übersprungen (%s): %s", cal_name, e)
+            except Exception:
+                pass
 
-    log.info("%d Termin(e) in den nächsten %dh gefunden.", len(events), config.lookahead_h)
+    events.sort(key=lambda e: e["start_dt"])
     return events
 
 
@@ -200,16 +178,11 @@ def _parse_start(vevent, tz, allday_hour: int) -> datetime:
     dtstart = vevent.get("dtstart")
     if dtstart is None:
         raise ValueError("Kein dtstart")
-
     val = dtstart.dt
     if isinstance(val, datetime):
-        if val.tzinfo is None:
-            return tz.localize(val)
-        return val.astimezone(tz)
-    else:
-        # Ganztägiger Termin (date-Objekt) → Uhrzeit aus Einstellung
-        naive = datetime(val.year, val.month, val.day, allday_hour, 0, 0)
-        return tz.localize(naive)
+        return val.astimezone(tz) if val.tzinfo else tz.localize(val)
+    naive = datetime(val.year, val.month, val.day, allday_hour, 0, 0)
+    return tz.localize(naive)
 
 
 def _parse_reminders(vevent) -> list[int]:
@@ -220,61 +193,114 @@ def _parse_reminders(vevent) -> list[int]:
             continue
         val = trigger.dt
         if isinstance(val, timedelta):
-            # Negative timedelta = Erinnerung VOR dem Termin
             m = int(-val.total_seconds() / 60)
             if m > 0:
                 mins.append(m)
-    return sorted(set(mins)) if mins else [30]  # Standard: 30 Minuten
+    return sorted(set(mins)) if mins else [30]
 
 
-# ─── WhatsApp ─────────────────────────────────────────────────────────────────
+# ─── WhatsApp Bridge (kommuniziert mit whatsapp-bridge/index.js) ─────────────
 
-def send_whatsapp(message: str, config: Config) -> bool:
-    try:
-        r = requests.get(
-            CALLMEBOT_URL,
-            params={"phone": config.phone, "text": message, "apikey": config.api_key},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            log.info("WhatsApp gesendet: %s", message[:80])
-            return True
-        log.error("WhatsApp Fehler (HTTP %d): %s", r.status_code, r.text[:200])
-        return False
-    except requests.RequestException as e:
-        log.error("WhatsApp Netzwerkfehler: %s", e)
-        return False
+class WhatsApp:
+    def __init__(self, my_phone: str):
+        self._phone = my_phone
+        # Chat-ID Format für whatsapp-web.js: "4915226310258@c.us"
+        self._my_chat_id = my_phone.lstrip("+").replace(" ", "") + "@c.us"
 
+    def send(self, message: str) -> bool:
+        try:
+            r = requests.post(f"{BRIDGE_URL}/send",
+                              json={"phone": self._phone, "message": message},
+                              timeout=10)
+            if r.status_code == 200:
+                log.info("WhatsApp gesendet: %s", message[:80])
+                return True
+            log.error("Bridge Fehler (HTTP %d): %s", r.status_code, r.text[:100])
+            return False
+        except requests.RequestException as e:
+            log.error("Bridge nicht erreichbar: %s", e)
+            return False
 
-def msg_erinnerung(event: dict, minutes_before: int) -> str:
-    start_dt = event["start_dt"]
-    title    = event["summary"]
-    zeit     = start_dt.strftime("%H:%M")
-    ort      = event["location"]
+    def receive(self) -> str | None:
+        """Gibt den Text der nächsten Nachricht zurück (nur von MeineNummer)."""
+        try:
+            r = requests.get(f"{BRIDGE_URL}/receive", timeout=5)
+            if r.status_code == 200 and r.text and r.text != "null":
+                data = r.json()
+                if data and data.get("from") == self._my_chat_id:
+                    return data.get("text")
+        except requests.RequestException:
+            pass
+        return None
 
-    if minutes_before >= 60 and minutes_before % 60 == 0:
-        h = minutes_before // 60
-        label = f"{h} Stunde{'n' if h > 1 else ''}"
-    elif minutes_before >= 60:
-        label = f"{minutes_before // 60}h {minutes_before % 60}min"
-    else:
-        label = f"{minutes_before} Minuten"
-
-    msg = f"Erinnerung: {title} startet in {label} ({zeit} Uhr)"
-    return msg + f" – {ort}" if ort else msg
-
-
-def msg_start(event: dict) -> str:
-    start_dt = event["start_dt"]
-    title    = event["summary"]
-    zeit     = start_dt.strftime("%H:%M")
-    ort      = event["location"]
-
-    msg = f"Jetzt gestartet: {title} ({zeit} Uhr)"
-    return msg + f" – {ort}" if ort else msg
+    def bridge_online(self) -> bool:
+        try:
+            r = requests.get(f"{BRIDGE_URL}/status", timeout=3)
+            return r.status_code == 200 and r.json().get("connected", False)
+        except Exception:
+            return False
 
 
-# ─── State (Duplikat-Schutz) ──────────────────────────────────────────────────
+# ─── KI-Assistent (Groq / Llama 3.1 – kostenlos) ────────────────────────────
+
+SYSTEM_PROMPT = """\
+Du bist ein persönlicher KI-Kalender-Assistent der über WhatsApp antwortet.
+Antworte auf Deutsch, kurz und freundlich (WhatsApp-Stil, kein Markdown).
+Heute ist: {today}
+
+Anstehende Termine (nächste 7 Tage):
+{events}
+
+Was du kannst:
+1. Termine abfragen: "Was hab ich morgen?", "Nächster Termin?", "Diese Woche?"
+2. Neuen Termin erstellen: Wenn der Nutzer einen Termin nennt, gib einen Google-Kalender-Link zurück.
+   Format: Schreib genau diese Zeile: LINK: https://calendar.google.com/calendar/r/eventedit?text=TITEL&dates=YYYYMMDDTHHMMSS/YYYYMMDDTHHMMSS
+   Der Endtermin ist 1 Stunde nach dem Start wenn nicht anders angegeben.
+   Erkläre danach kurz: "Tippe auf den Link um den Termin zu speichern."
+3. Allgemeine Fragen zur Terminplanung beantworten.
+
+Zeitzone: Europe/Berlin. Alle Zeiten in UTC+2 (Sommerzeit) oder UTC+1 (Winterzeit) umrechnen.
+"""
+
+
+class KI:
+    def __init__(self, api_key: str, config: Config):
+        self._client = Groq(api_key=api_key)
+        self._config = config
+
+    def antworten(self, nachricht: str, events: list[dict]) -> str:
+        tz = pytz.timezone(self._config.timezone)
+        today = datetime.now(tz).strftime("%A, %d.%m.%Y %H:%M Uhr")
+        events_text = self._events_zu_text(events, tz)
+        system = SYSTEM_PROMPT.format(today=today, events=events_text)
+        try:
+            resp = self._client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                max_tokens=600,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": nachricht},
+                ],
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            log.error("Groq API Fehler: %s", e)
+            return "Entschuldigung, ich konnte deine Anfrage gerade nicht verarbeiten."
+
+    @staticmethod
+    def _events_zu_text(events: list[dict], tz) -> str:
+        if not events:
+            return "Keine Termine in den nächsten 7 Tagen."
+        lines = []
+        for e in events:
+            dt = e["start_dt"].astimezone(tz).strftime("%a %d.%m. %H:%M")
+            ort = f" ({e['location']})" if e.get("location") else ""
+            cal = f" [{e['calendar']}]" if e.get("calendar") else ""
+            lines.append(f"- {dt}: {e['summary']}{ort}{cal}")
+        return "\n".join(lines)
+
+
+# ─── State (Duplikat-Schutz für Erinnerungen) ────────────────────────────────
 
 def load_state() -> set:
     if not os.path.exists(STATE_FILE):
@@ -289,7 +315,8 @@ def load_state() -> set:
 def save_state(state: set):
     try:
         dn = os.path.dirname(STATE_FILE) or "."
-        with tempfile.NamedTemporaryFile("w", dir=dn, delete=False, suffix=".tmp", encoding="utf-8") as tmp:
+        with tempfile.NamedTemporaryFile("w", dir=dn, delete=False,
+                                         suffix=".tmp", encoding="utf-8") as tmp:
             json.dump(sorted(state), tmp, ensure_ascii=False)
             tmp_path = tmp.name
         os.replace(tmp_path, STATE_FILE)
@@ -307,25 +334,24 @@ def purge_old(state: set) -> set:
     return {k for k in state if k.rsplit("_", 1)[-1] >= cutoff}
 
 
-# ─── Scheduler ───────────────────────────────────────────────────────────────
+# ─── Automatische Erinnerungen ───────────────────────────────────────────────
 
-def poll_and_schedule(config: Config, scheduler: BackgroundScheduler, state: set):
+def poll_and_schedule(config: Config, whatsapp: WhatsApp,
+                      scheduler: BackgroundScheduler, state: set):
     events = fetch_events(config)
-    now    = datetime.now(pytz.utc)
-
+    now = datetime.now(pytz.utc)
     for event in events:
-        uid      = event["uid"]
-        start_dt = event["start_dt"]
-
+        uid, start_dt = event["uid"], event["start_dt"]
         for mins in event["reminder_minutes"]:
             fire_dt = start_dt - timedelta(minutes=mins)
-            key     = make_key(uid, f"r{mins}", start_dt)
+            key = make_key(uid, f"r{mins}", start_dt)
             _schedule(scheduler, key, fire_dt, now, state,
-                      lambda e=event, m=mins, k=key: _send(msg_erinnerung(e, m), k, config, state))
-
+                      lambda e=event, m=mins, k=key:
+                      _send_reminder(whatsapp, e, m, k, state))
         start_key = make_key(uid, "start", start_dt)
         _schedule(scheduler, start_key, start_dt, now, state,
-                  lambda e=event, k=start_key: _send(msg_start(e), k, config, state))
+                  lambda e=event, k=start_key:
+                  _send_start(whatsapp, e, k, state))
 
 
 def _schedule(scheduler, key, fire_dt, now, state, fn):
@@ -333,45 +359,128 @@ def _schedule(scheduler, key, fire_dt, now, state, fn):
         return
     scheduler.add_job(fn, trigger=DateTrigger(run_date=fire_dt),
                       id=key, replace_existing=False, misfire_grace_time=120)
-    log.debug("Geplant: %s um %s", key[:50], fire_dt.strftime("%d.%m. %H:%M"))
 
 
-def _send(message: str, key: str, config: Config, state: set):
+def _send_reminder(whatsapp: WhatsApp, event: dict, mins: int, key: str, state: set):
     if key in state:
         return
-    if send_whatsapp(message, config):
+    zeit = event["start_dt"].strftime("%H:%M")
+    if mins >= 60 and mins % 60 == 0:
+        h = mins // 60
+        label = f"{h} Stunde{'n' if h > 1 else ''}"
+    elif mins >= 60:
+        label = f"{mins // 60}h {mins % 60}min"
+    else:
+        label = f"{mins} Minuten"
+    msg = f"Erinnerung: {event['summary']} startet in {label} ({zeit} Uhr)"
+    if event.get("location"):
+        msg += f" – {event['location']}"
+    if whatsapp.send(msg):
         state.add(key)
         save_state(state)
+
+
+def _send_start(whatsapp: WhatsApp, event: dict, key: str, state: set):
+    if key in state:
+        return
+    zeit = event["start_dt"].strftime("%H:%M")
+    msg = f"Jetzt gestartet: {event['summary']} ({zeit} Uhr)"
+    if event.get("location"):
+        msg += f" – {event['location']}"
+    if whatsapp.send(msg):
+        state.add(key)
+        save_state(state)
+
+
+# ─── Nachrichten-Loop ────────────────────────────────────────────────────────
+
+_events_cache:      list[dict]       = []
+_events_cache_zeit: datetime | None  = None
+_cache_lock = threading.Lock()
+
+
+def get_events_cached(config: Config) -> list[dict]:
+    global _events_cache, _events_cache_zeit
+    with _cache_lock:
+        now = datetime.now(pytz.utc)
+        if (_events_cache_zeit is None or
+                (now - _events_cache_zeit).total_seconds() > 300):
+            _events_cache = fetch_events(config, lookahead_hours=7 * 24)
+            _events_cache_zeit = now
+        return _events_cache
+
+
+def message_loop(config: Config, whatsapp: WhatsApp, ki: KI,
+                 stop_event: threading.Event):
+    log.info("Nachrichten-Loop gestartet. Warte auf eingehende Nachrichten...")
+    while not stop_event.is_set():
+        try:
+            text = whatsapp.receive()
+            if text:
+                log.info("Eingehende Nachricht: %s", text[:60])
+                events = get_events_cached(config)
+                antwort = ki.antworten(text, events)
+                whatsapp.send(antwort)
+        except Exception as e:
+            log.error("Fehler im Nachrichten-Loop: %s", e)
+        time.sleep(3)
 
 
 # ─── Hauptprogramm ───────────────────────────────────────────────────────────
 
 def main():
     setup_logging()
-    log.info("WhatsApp Kalender-Bot startet...")
+    log.info("WhatsApp Kalender-Bot mit KI startet...")
 
     config    = Config()
+    whatsapp  = WhatsApp(config.meine_nummer)
+    ki        = KI(config.groq_key, config)
     state     = load_state()
     scheduler = BackgroundScheduler(timezone=config.timezone)
+    stop_event = threading.Event()
+
+    # Auf Bridge warten
+    log.info("Warte auf WhatsApp-Bridge (whatsapp-bridge muss laufen)...")
+    for i in range(30):
+        if whatsapp.bridge_online():
+            log.info("WhatsApp-Bridge verbunden.")
+            break
+        if i == 0:
+            log.info("Bridge noch nicht bereit – warte bis zu 60 Sekunden...")
+        time.sleep(2)
+    else:
+        log.error(
+            "WhatsApp-Bridge nicht erreichbar!\n"
+            "Bitte zuerst start.bat ausführen (startet Bridge + Bot zusammen)."
+        )
+        sys.exit(1)
 
     def poll():
         nonlocal state
         state = purge_old(state)
-        poll_and_schedule(config, scheduler, state)
+        poll_and_schedule(config, whatsapp, scheduler, state)
+        with _cache_lock:
+            global _events_cache, _events_cache_zeit
+            _events_cache = []
+            _events_cache_zeit = None
 
-    poll()  # Sofort beim Start
+    poll()
     scheduler.add_job(poll, trigger=IntervalTrigger(minutes=config.poll_minutes),
                       id="poll", replace_existing=True)
     scheduler.start()
 
-    log.info(
-        "Bot läuft. %d Kalender überwacht. Abfrage alle %d Minuten. (Strg+C zum Beenden)",
-        len(config.calendars),
-        config.poll_minutes,
+    msg_thread = threading.Thread(
+        target=message_loop,
+        args=(config, whatsapp, ki, stop_event),
+        daemon=True,
     )
+    msg_thread.start()
+
+    log.info("Bot läuft! %d Kalender überwacht. Schreib mir auf WhatsApp!", len(config.calendars))
 
     def shutdown(sig=None, frame=None):
         log.info("Bot wird beendet...")
+        stop_event.set()
         scheduler.shutdown(wait=False)
         sys.exit(0)
 
